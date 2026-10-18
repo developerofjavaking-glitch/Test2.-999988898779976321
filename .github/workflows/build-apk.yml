@@ -2,12 +2,30 @@ name: Build Tic Tac Toe APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tic-tac-toe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.29.3"
+  APP_DIR: generated_app
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -15,254 +33,875 @@ jobs:
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
-          java-version: '17'
+          distribution: zulu
+          java-version: "17"
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.19.x'
-          channel: 'stable'
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
 
-      - name: Setup App Package, Sound Effects, Logo, and Source Code
+      - name: Create Android project
         run: |
-          # 1. Initialize Flutter Project with requested Package Name
-          flutter create . --org cok.aokjfjigg.tic --project-name java --force
+          set -euo pipefail
 
-          # 2. Add Audioplayers dependency to pubspec.yaml
-          flutter pub add audioplayers
+          flutter config --no-analytics
 
-          # 3. Create sound effects inside assets/
-          mkdir -p assets
-          
-          # Generate a short 44100Hz WAV click sound byte
-          python3 -c "
-          import wave, struct, math
-          def gen_wav(filename, freq, duration):
-              sample_rate = 44100
-              n_samples = int(sample_rate * duration)
-              with wave.open(filename, 'w') as f:
-                  f.setnchannels(1)
-                  f.setsampwidth(2)
-                  f.setframerate(sample_rate)
-                  for i in range(n_samples):
-                      t = i / sample_rate
-                      value = int(16000 * math.sin(2 * math.pi * freq * t))
-                      f.writeframes(struct.pack('<h', value))
+          flutter create "$APP_DIR" \
+            --platforms=android \
+            --org cok.aokjfjigg.tic \
+            --project-name tic_tac_toe \
+            --android-language kotlin \
+            --empty
 
-          gen_wav('assets/tap.wav', 600, 0.08)
-          gen_wav('assets/win.wav', 880, 0.3)
-          "
+      - name: Write dependencies
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
 
-          # 4. Enable assets in pubspec.yaml
-          sed -i '/flutter:/a \  assets:\n    - assets/tap.wav\n    - assets/win.wav' pubspec.yaml
+          cat > pubspec.yaml <<'EOF'
+          name: tic_tac_toe
+          description: A polished offline Tic Tac Toe game.
+          publish_to: "none"
+          version: 1.0.0+1
 
-          # 5. Overwrite lib/main.dart with sound effects and custom logo design
-          mkdir -p lib
-          cat << 'EOF' > lib/main.dart
-          import 'package:flutter/material.dart';
+          environment:
+            sdk: ">=3.7.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            audioplayers: 6.4.0
+            shared_preferences: 2.5.3
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: 5.0.0
+
+          flutter:
+            uses-material-design: true
+            assets:
+              - assets/tap.wav
+              - assets/win.wav
+              - assets/draw.wav
+          EOF
+
+          cat > analysis_options.yaml <<'EOF'
+          include: package:flutter_lints/flutter.yaml
+          EOF
+
+      - name: Generate sounds and launcher icons
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+
+          python3 <<'PY'
+          import math
+          import pathlib
+          import struct
+          import wave
+          import zlib
+
+          assets = pathlib.Path("assets")
+          assets.mkdir(exist_ok=True)
+
+          def make_sound(name, notes, duration):
+              rate = 44100
+              frames = bytearray()
+              for frequency in notes:
+                  count = int(rate * duration)
+                  for i in range(count):
+                      t = i / rate
+                      envelope = min(1.0, i / (rate * 0.006))
+                      envelope *= max(0.0, 1.0 - i / count) ** 1.5
+                      value = int(
+                          13000 * envelope *
+                          math.sin(2 * math.pi * frequency * t)
+                      )
+                      frames.extend(struct.pack("<h", value))
+              with wave.open(str(assets / name), "wb") as output:
+                  output.setnchannels(1)
+                  output.setsampwidth(2)
+                  output.setframerate(rate)
+                  output.writeframes(frames)
+
+          make_sound("tap.wav", [660], 0.075)
+          make_sound("win.wav", [523.25, 659.25, 783.99, 1046.5], 0.12)
+          make_sound("draw.wav", [440, 349.23], 0.16)
+
+          # Generate PNGs directly with Python's standard library.
+          def chunk(kind, data):
+              return (
+                  struct.pack(">I", len(data)) + kind + data +
+                  struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+              )
+
+          def make_icon(size):
+              rows = bytearray()
+              for y in range(size):
+                  rows.append(0)
+                  for x in range(size):
+                      u, v = x / size, y / size
+                      color = (15 + int(15 * v), 23, 48 + int(30 * u))
+
+                      # Everything important stays inside the safe central area.
+                      if (
+                          (abs(u - 0.42) < 0.009 or abs(u - 0.58) < 0.009)
+                          and 0.25 < v < 0.75
+                      ) or (
+                          (abs(v - 0.42) < 0.009 or abs(v - 0.58) < 0.009)
+                          and 0.25 < u < 0.75
+                      ):
+                          color = (91, 104, 151)
+
+                      for cx, cy in [(0.33, 0.33), (0.50, 0.50), (0.67, 0.67)]:
+                          dx, dy = u - cx, v - cy
+                          if max(abs(dx), abs(dy)) < 0.05:
+                              if min(abs(dx - dy), abs(dx + dy)) < 0.015:
+                                  color = (77, 231, 219)
+
+                      for cx, cy in [(0.67, 0.33), (0.33, 0.67)]:
+                          distance = math.hypot(u - cx, v - cy)
+                          if 0.032 < distance < 0.052:
+                              color = (248, 128, 184)
+
+                      rows.extend((*color, 255))
+
+              header = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+              return (
+                  b"\x89PNG\r\n\x1a\n" +
+                  chunk(b"IHDR", header) +
+                  chunk(b"IDAT", zlib.compress(bytes(rows), 9)) +
+                  chunk(b"IEND", b"")
+              )
+
+          resources = pathlib.Path("android/app/src/main/res")
+          for density, size in {
+              "mdpi": 48,
+              "hdpi": 72,
+              "xhdpi": 96,
+              "xxhdpi": 144,
+              "xxxhdpi": 192,
+          }.items():
+              folder = resources / f"mipmap-{density}"
+              folder.mkdir(parents=True, exist_ok=True)
+              (folder / "ic_launcher.png").write_bytes(make_icon(size))
+
+          manifest = pathlib.Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text()
+          text = text.replace(
+              'android:label="tic_tac_toe"',
+              'android:label="Tic Tac Toe Pro"',
+          )
+          manifest.write_text(text)
+
+          # Preserve the package ID requested in the original workflow.
+          import re
+          for filename in ["build.gradle.kts", "build.gradle"]:
+              path = pathlib.Path("android/app") / filename
+              if path.exists():
+                  text = path.read_text()
+                  text, count = re.subn(
+                      r'applicationId\s*(?:=\s*)?["\'][^"\']+["\']',
+                      'applicationId = "cok.aokjfjigg.tic.java"'
+                      if filename.endswith(".kts")
+                      else 'applicationId "cok.aokjfjigg.tic.java"',
+                      text,
+                  )
+                  if count != 1:
+                      raise RuntimeError("Could not set Android application ID")
+                  path.write_text(text)
+          PY
+
+      - name: Write game engine
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          mkdir -p lib test
+
+          cat > lib/game.dart <<'EOF'
+          import 'dart:math';
+
+          const winningLines = <List<int>>[
+            [0, 1, 2],
+            [3, 4, 5],
+            [6, 7, 8],
+            [0, 3, 6],
+            [1, 4, 7],
+            [2, 5, 8],
+            [0, 4, 8],
+            [2, 4, 6],
+          ];
+
+          List<int> winningCells(List<String> board) {
+            for (final line in winningLines) {
+              if (board[line[0]].isNotEmpty &&
+                  board[line[0]] == board[line[1]] &&
+                  board[line[1]] == board[line[2]]) {
+                return line;
+              }
+            }
+            return [];
+          }
+
+          String outcome(List<String> board) {
+            final line = winningCells(board);
+            if (line.isNotEmpty) return board[line.first];
+            return board.contains('') ? '' : 'draw';
+          }
+
+          int _minimax(List<String> board, bool maximizing, int depth) {
+            final result = outcome(board);
+            if (result == 'O') return 10 - depth;
+            if (result == 'X') return depth - 10;
+            if (result == 'draw') return 0;
+
+            var best = maximizing ? -100 : 100;
+            for (var i = 0; i < 9; i++) {
+              if (board[i].isNotEmpty) continue;
+              board[i] = maximizing ? 'O' : 'X';
+              final score = _minimax(board, !maximizing, depth + 1);
+              board[i] = '';
+              best = maximizing ? max(best, score) : min(best, score);
+            }
+            return best;
+          }
+
+          int chooseMove(List<String> source, String difficulty, Random random) {
+            final board = List<String>.from(source);
+            if (outcome(board).isNotEmpty) return -1;
+
+            final available = [
+              for (var i = 0; i < 9; i++)
+                if (board[i].isEmpty) i,
+            ];
+            if (available.isEmpty) return -1;
+
+            if (difficulty == 'Easy' ||
+                (difficulty == 'Medium' && random.nextDouble() < 0.35)) {
+              return available[random.nextInt(available.length)];
+            }
+
+            var bestScore = -100;
+            final bestMoves = <int>[];
+            for (final index in available) {
+              board[index] = 'O';
+              final score = _minimax(board, false, 0);
+              board[index] = '';
+              if (score > bestScore) {
+                bestScore = score;
+                bestMoves
+                  ..clear()
+                  ..add(index);
+              } else if (score == bestScore) {
+                bestMoves.add(index);
+              }
+            }
+            return bestMoves[random.nextInt(bestMoves.length)];
+          }
+          EOF
+
+      - name: Write application UI
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+
+          cat > lib/main.dart <<'EOF'
+          import 'dart:async';
+          import 'dart:math';
+
           import 'package:audioplayers/audioplayers.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
 
-          void main() => runApp(const TicTacToeApp());
+          import 'game.dart';
 
-          class TicTacToeApp extends StatelessWidget {
-            const TicTacToeApp({super.key});
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            final preferences = await SharedPreferences.getInstance();
+            runApp(TicTacToeApp(preferences: preferences));
+          }
+
+          class TicTacToeApp extends StatefulWidget {
+            const TicTacToeApp({super.key, required this.preferences});
+            final SharedPreferences preferences;
+
+            @override
+            State<TicTacToeApp> createState() => _TicTacToeAppState();
+          }
+
+          class _TicTacToeAppState extends State<TicTacToeApp> {
+            late bool dark = widget.preferences.getBool('dark') ?? true;
+
+            ThemeData theme(Brightness brightness) {
+              final scheme = ColorScheme.fromSeed(
+                seedColor: const Color(0xFF7467EF),
+                brightness: brightness,
+              );
+              return ThemeData(
+                useMaterial3: true,
+                colorScheme: scheme,
+                scaffoldBackgroundColor: brightness == Brightness.dark
+                    ? const Color(0xFF0D1224)
+                    : const Color(0xFFF3F4FC),
+              );
+            }
 
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
                 title: 'Tic Tac Toe Pro',
                 debugShowCheckedModeBanner: false,
-                theme: ThemeData(
-                  brightness: Brightness.dark,
-                  primarySwatch: Colors.deepPurple,
-                  scaffoldBackgroundColor: const Color(0xFF0F172A),
+                theme: theme(Brightness.light),
+                darkTheme: theme(Brightness.dark),
+                themeMode: dark ? ThemeMode.dark : ThemeMode.light,
+                home: GameScreen(
+                  preferences: widget.preferences,
+                  dark: dark,
+                  toggleTheme: () {
+                    setState(() => dark = !dark);
+                    unawaited(widget.preferences.setBool('dark', dark));
+                  },
                 ),
-                home: const TicTacToeScreen(),
               );
             }
           }
 
-          class TicTacToeScreen extends StatefulWidget {
-            const TicTacToeScreen({super.key});
+          class GameScreen extends StatefulWidget {
+            const GameScreen({
+              super.key,
+              required this.preferences,
+              required this.dark,
+              required this.toggleTheme,
+            });
+
+            final SharedPreferences preferences;
+            final bool dark;
+            final VoidCallback toggleTheme;
 
             @override
-            State<TicTacToeScreen> createState() => _TicTacToeScreenState();
+            State<GameScreen> createState() => _GameScreenState();
           }
 
-          class _TicTacToeScreenState extends State<TicTacToeScreen> {
-            List<String> board = List.filled(9, '');
-            String winner = '';
-            bool isTurnX = true;
-            final AudioPlayer _audioPlayer = AudioPlayer();
+          class _GameScreenState extends State<GameScreen> {
+            final _random = Random();
+            final _audio = AudioPlayer();
+            Timer? _timer;
 
-            void _playSound(String assetName) async {
-              try {
-                await _audioPlayer.stop();
-                await _audioPlayer.play(AssetSource(assetName));
-              } catch (_) {}
+            List<String> _board = List.filled(9, '');
+            String _turn = 'X';
+            String _result = '';
+            bool _thinking = false;
+            bool _disposed = false;
+
+            late bool _ai;
+            late bool _sound;
+            late String _difficulty;
+            int _xScore = 0;
+            int _oScore = 0;
+            int _draws = 0;
+
+            SharedPreferences get _prefs => widget.preferences;
+            String get _scoreKey => _ai ? 'ai_$_difficulty' : 'local';
+            Color get _xColor => widget.dark
+                ? const Color(0xFF5EEAD4)
+                : const Color(0xFF00796B);
+            Color get _oColor => widget.dark
+                ? const Color(0xFFF9A8D4)
+                : const Color(0xFFBE185D);
+
+            @override
+            void initState() {
+              super.initState();
+              _ai = _prefs.getBool('ai') ?? true;
+              _sound = _prefs.getBool('sound') ?? true;
+              final saved = _prefs.getString('difficulty');
+              _difficulty = ['Easy', 'Medium', 'Hard'].contains(saved)
+                  ? saved!
+                  : 'Hard';
+              _loadScores();
             }
 
-            void _handleTap(int index) {
-              if (board[index] == '' && winner == '') {
-                _playSound('tap.wav');
-                setState(() {
-                  board[index] = isTurnX ? 'X' : 'O';
-                  isTurnX = !isTurnX;
-                  winner = _checkWinner();
-                  if (winner.isNotEmpty) {
-                    _playSound('win.wav');
-                  }
+            void _loadScores() {
+              _xScore = _prefs.getInt('${_scoreKey}_x') ?? 0;
+              _oScore = _prefs.getInt('${_scoreKey}_o') ?? 0;
+              _draws = _prefs.getInt('${_scoreKey}_draws') ?? 0;
+            }
+
+            Future<void> _saveScores() async {
+              final key = _scoreKey;
+              final x = _xScore;
+              final o = _oScore;
+              final draws = _draws;
+              await _prefs.setInt('${key}_x', x);
+              await _prefs.setInt('${key}_o', o);
+              await _prefs.setInt('${key}_draws', draws);
+            }
+
+            Future<void> _play(String filename) async {
+              if (!_sound || _disposed) return;
+              try {
+                await _audio.stop();
+                if (!_disposed && _sound) {
+                  await _audio.play(AssetSource(filename));
+                }
+              } catch (_) {
+                // Audio failure must never interrupt a game.
+              }
+            }
+
+            void _restart() {
+              _timer?.cancel();
+              setState(() {
+                _board = List.filled(9, '');
+                _turn = 'X';
+                _result = '';
+                _thinking = false;
+              });
+            }
+
+            void _changeMode(bool ai) {
+              if (_ai == ai) return;
+              _restart();
+              setState(() {
+                _ai = ai;
+                _loadScores();
+              });
+              unawaited(_prefs.setBool('ai', ai));
+            }
+
+            void _changeDifficulty(String? value) {
+              if (value == null || value == _difficulty) return;
+              _restart();
+              setState(() {
+                _difficulty = value;
+                _loadScores();
+              });
+              unawaited(_prefs.setString('difficulty', value));
+            }
+
+            void _tap(int index) {
+              if (_thinking ||
+                  _result.isNotEmpty ||
+                  _board[index].isNotEmpty ||
+                  (_ai && _turn == 'O')) {
+                return;
+              }
+              unawaited(HapticFeedback.selectionClick());
+              _move(index);
+            }
+
+            void _move(int index) {
+              setState(() {
+                _board[index] = _turn;
+                _result = outcome(_board);
+                if (_result == 'X') _xScore++;
+                if (_result == 'O') _oScore++;
+                if (_result == 'draw') _draws++;
+                if (_result.isEmpty) _turn = _turn == 'X' ? 'O' : 'X';
+              });
+
+              unawaited(_play(
+                _result == 'draw'
+                    ? 'draw.wav'
+                    : _result.isNotEmpty
+                        ? 'win.wav'
+                        : 'tap.wav',
+              ));
+
+              if (_result.isNotEmpty) {
+                unawaited(_saveScores());
+              } else if (_ai && _turn == 'O') {
+                setState(() => _thinking = true);
+                _timer = Timer(const Duration(milliseconds: 480), () {
+                  if (!mounted) return;
+                  final index = chooseMove(_board, _difficulty, _random);
+                  setState(() => _thinking = false);
+                  if (index >= 0) _move(index);
                 });
               }
             }
 
-            String _checkWinner() {
-              const winningCombinations = [
-                [0, 1, 2], [3, 4, 5], [6, 7, 8],
-                [0, 3, 6], [1, 4, 7], [2, 5, 8],
-                [0, 4, 8], [2, 4, 6]
-              ];
-
-              for (var combo in winningCombinations) {
-                String a = board[combo[0]];
-                String b = board[combo[1]];
-                String c = board[combo[2]];
-                if (a != '' && a == b && b == c) {
-                  return '$a Wins!';
-                }
-              }
-
-              if (!board.contains('')) {
-                return 'It\'s a Draw!';
-              }
-              return '';
+            Future<void> _resetScores() async {
+              final confirmed = await showDialog<bool>(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Reset scores?'),
+                  content: const Text(
+                    'This clears scores for the selected mode and difficulty. '
+                    'Your current round will also restart.',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, false),
+                      child: const Text('Cancel'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.pop(context, true),
+                      child: const Text('Reset'),
+                    ),
+                  ],
+                ),
+              );
+              if (confirmed != true || !mounted) return;
+              _restart();
+              setState(() {
+                _xScore = 0;
+                _oScore = 0;
+                _draws = 0;
+              });
+              await _saveScores();
             }
 
-            void _resetGame() {
-              _playSound('tap.wav');
-              setState(() {
-                board = List.filled(9, '');
-                isTurnX = true;
-                winner = '';
-              });
+            String get _status {
+              if (_result == 'draw') return 'A perfect standoff!';
+              if (_result == 'X') return _ai ? 'You won! Nicely played.' : 'Player X wins!';
+              if (_result == 'O') return _ai ? 'AI wins. Try again!' : 'Player O wins!';
+              if (_thinking) return 'AI is thinking…';
+              return _ai ? 'Your move' : 'Player $_turn’s move';
+            }
+
+            Widget _scoreCard(String label, int score, Color color, bool active) {
+              final scheme = Theme.of(context).colorScheme;
+              return Expanded(
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 4),
+                  decoration: BoxDecoration(
+                    color: active
+                        ? color.withValues(alpha: 0.12)
+                        : scheme.surfaceContainer,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: active ? color : Colors.transparent,
+                      width: 1.5,
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      Text(
+                        '$score',
+                        style: TextStyle(
+                          color: color,
+                          fontSize: 30,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(label, textAlign: TextAlign.center),
+                    ],
+                  ),
+                ),
+              );
             }
 
             @override
             void dispose() {
-              _audioPlayer.dispose();
+              _disposed = true;
+              _timer?.cancel();
+              unawaited(_audio.dispose());
               super.dispose();
             }
 
             @override
             Widget build(BuildContext context) {
+              final scheme = Theme.of(context).colorScheme;
+              final highlights = winningCells(_board);
+
               return Scaffold(
                 body: SafeArea(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      // Modern Logo / Header
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          gradient: const LinearGradient(
-                            colors: [Colors.cyanAccent, Colors.purpleAccent],
-                          ),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.purpleAccent.withOpacity(0.5),
-                              blurRadius: 20,
-                              spreadRadius: 2,
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 480),
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    gradient: const LinearGradient(
+                                      colors: [Color(0xFF7164EE), Color(0xFFB36AE2)],
+                                    ),
+                                    borderRadius: BorderRadius.circular(18),
+                                  ),
+                                  child: const Icon(
+                                    Icons.grid_3x3_rounded,
+                                    color: Colors.white,
+                                    size: 30,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                const Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'TIC TAC TOE',
+                                        style: TextStyle(
+                                          fontSize: 19,
+                                          fontWeight: FontWeight.w900,
+                                          letterSpacing: 1,
+                                        ),
+                                      ),
+                                      Text('Small board. Big brain.'),
+                                    ],
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: _sound ? 'Mute sound' : 'Enable sound',
+                                  onPressed: () {
+                                    setState(() => _sound = !_sound);
+                                    unawaited(_prefs.setBool('sound', _sound));
+                                    if (!_sound) unawaited(_audio.stop());
+                                  },
+                                  icon: Icon(
+                                    _sound
+                                        ? Icons.volume_up_rounded
+                                        : Icons.volume_off_rounded,
+                                  ),
+                                ),
+                                IconButton(
+                                  tooltip: 'Switch theme',
+                                  onPressed: widget.toggleTheme,
+                                  icon: Icon(
+                                    widget.dark
+                                        ? Icons.light_mode_rounded
+                                        : Icons.dark_mode_rounded,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 28),
+                            SegmentedButton<bool>(
+                              segments: const [
+                                ButtonSegment(
+                                  value: true,
+                                  label: Text('Vs AI'),
+                                  icon: Icon(Icons.smart_toy_outlined),
+                                ),
+                                ButtonSegment(
+                                  value: false,
+                                  label: Text('2 Players'),
+                                  icon: Icon(Icons.people_outline_rounded),
+                                ),
+                              ],
+                              selected: {_ai},
+                              onSelectionChanged: (selection) {
+                                _changeMode(selection.first);
+                              },
+                            ),
+                            const SizedBox(height: 14),
+                            if (_ai)
+                              Row(
+                                children: [
+                                  const Icon(Icons.tune_rounded, size: 20),
+                                  const SizedBox(width: 8),
+                                  const Text('Difficulty'),
+                                  const Spacer(),
+                                  DropdownButton<String>(
+                                    value: _difficulty,
+                                    underline: const SizedBox.shrink(),
+                                    borderRadius: BorderRadius.circular(16),
+                                    items: [
+                                      for (final level in ['Easy', 'Medium', 'Hard'])
+                                        DropdownMenuItem(
+                                          value: level,
+                                          child: Text(level),
+                                        ),
+                                    ],
+                                    onChanged: _changeDifficulty,
+                                  ),
+                                ],
+                              )
+                            else
+                              const Padding(
+                                padding: EdgeInsets.symmetric(vertical: 14),
+                                child: Text(
+                                  'Pass the phone and challenge a friend.',
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
+                            const SizedBox(height: 12),
+                            Row(
+                              children: [
+                                _scoreCard(
+                                  _ai ? 'You · X' : 'Player X',
+                                  _xScore,
+                                  _xColor,
+                                  _turn == 'X' && _result.isEmpty,
+                                ),
+                                const SizedBox(width: 10),
+                                _scoreCard(
+                                  'Draws',
+                                  _draws,
+                                  scheme.onSurfaceVariant,
+                                  false,
+                                ),
+                                const SizedBox(width: 10),
+                                _scoreCard(
+                                  _ai ? 'AI · O' : 'Player O',
+                                  _oScore,
+                                  _oColor,
+                                  _turn == 'O' && _result.isEmpty,
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 24),
+                            Semantics(
+                              liveRegion: true,
+                              child: AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 180),
+                                child: Text(
+                                  _status,
+                                  key: ValueKey(_status),
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    fontSize: 23,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              _result.isNotEmpty
+                                  ? 'Start another round to keep the rivalry going.'
+                                  : _ai && _difficulty == 'Hard'
+                                      ? 'Hard AI never loses. Can you force a draw?'
+                                      : 'Connect three in a row to win.',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: scheme.onSurfaceVariant),
+                            ),
+                            const SizedBox(height: 24),
+                            Center(
+                              child: ConstrainedBox(
+                                constraints: const BoxConstraints(maxWidth: 380),
+                                child: AspectRatio(
+                                  aspectRatio: 1,
+                                  child: GridView.builder(
+                                    padding: EdgeInsets.zero,
+                                    physics: const NeverScrollableScrollPhysics(),
+                                    itemCount: 9,
+                                    gridDelegate:
+                                        const SliverGridDelegateWithFixedCrossAxisCount(
+                                      crossAxisCount: 3,
+                                      crossAxisSpacing: 12,
+                                      mainAxisSpacing: 12,
+                                    ),
+                                    itemBuilder: (context, index) {
+                                      final mark = _board[index];
+                                      final color = mark == 'O' ? _oColor : _xColor;
+                                      final winning = highlights.contains(index);
+                                      final enabled = mark.isEmpty &&
+                                          _result.isEmpty &&
+                                          !_thinking;
+
+                                      return Semantics(
+                                        button: true,
+                                        enabled: enabled,
+                                        label: 'Row ${index ~/ 3 + 1}, '
+                                            'column ${index % 3 + 1}, '
+                                            '${mark.isEmpty ? "empty" : mark}',
+                                        child: AnimatedContainer(
+                                          duration: const Duration(milliseconds: 250),
+                                          decoration: BoxDecoration(
+                                            color: winning
+                                                ? color.withValues(alpha: 0.18)
+                                                : scheme.surfaceContainer,
+                                            borderRadius: BorderRadius.circular(22),
+                                            border: Border.all(
+                                              color: winning
+                                                  ? color
+                                                  : scheme.outlineVariant
+                                                      .withValues(alpha: 0.35),
+                                              width: winning ? 2 : 1,
+                                            ),
+                                          ),
+                                          child: Material(
+                                            color: Colors.transparent,
+                                            child: InkWell(
+                                              borderRadius: BorderRadius.circular(22),
+                                              onTap: enabled ? () => _tap(index) : null,
+                                              child: Center(
+                                                child: AnimatedSwitcher(
+                                                  duration:
+                                                      const Duration(milliseconds: 220),
+                                                  transitionBuilder: (child, animation) {
+                                                    return ScaleTransition(
+                                                      scale: animation,
+                                                      child: FadeTransition(
+                                                        opacity: animation,
+                                                        child: child,
+                                                      ),
+                                                    );
+                                                  },
+                                                  child: Text(
+                                                    mark,
+                                                    key: ValueKey('$index-$mark'),
+                                                    style: TextStyle(
+                                                      color: color,
+                                                      fontSize: 58,
+                                                      height: 1,
+                                                      fontWeight: FontWeight.w800,
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 26),
+                            FilledButton.icon(
+                              onPressed: _restart,
+                              icon: const Icon(Icons.refresh_rounded),
+                              label: Text(
+                                _result.isEmpty ? 'Restart round' : 'Play again',
+                              ),
+                              style: FilledButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(vertical: 17),
+                                textStyle: const TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(18),
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextButton.icon(
+                              onPressed: _resetScores,
+                              icon: const Icon(Icons.delete_outline_rounded, size: 18),
+                              label: const Text('Reset scores'),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              'OFFLINE • NO ADS • JUST PLAY',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                color: scheme.onSurfaceVariant,
+                                fontSize: 11,
+                                letterSpacing: 2,
+                              ),
                             ),
                           ],
                         ),
-                        child: const Icon(
-                          Icons.grid_3x3_rounded,
-                          size: 50,
-                          color: Colors.black,
-                        ),
                       ),
-                      const SizedBox(height: 15),
-                      const Text(
-                        'TIC TAC TOE',
-                        style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                          letterSpacing: 3,
-                          color: Colors.white,
-                        ),
-                      ),
-                      const SizedBox(height: 25),
-                      Text(
-                        winner.isEmpty ? 'Player Turn: ${isTurnX ? "X" : "O"}' : winner,
-                        style: TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w600,
-                          color: winner.contains('Wins') ? Colors.greenAccent : Colors.cyanAccent,
-                        ),
-                      ),
-                      const SizedBox(height: 30),
-                      Center(
-                        child: SizedBox(
-                          width: 320,
-                          height: 320,
-                          child: GridView.builder(
-                            physics: const NeverScrollableScrollPhysics(),
-                            itemCount: 9,
-                            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                              crossAxisCount: 3,
-                              crossAxisSpacing: 8,
-                              mainAxisSpacing: 8,
-                            ),
-                            itemBuilder: (context, index) {
-                              return GestureDetector(
-                                onTap: () => _handleTap(index),
-                                child: AnimatedContainer(
-                                  duration: const Duration(milliseconds: 200),
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFF1E293B),
-                                    borderRadius: BorderRadius.circular(12),
-                                    border: Border.all(
-                                      color: Colors.white12,
-                                      width: 1.5,
-                                    ),
-                                  ),
-                                  child: Center(
-                                    child: Text(
-                                      board[index],
-                                      style: TextStyle(
-                                        fontSize: 52,
-                                        fontWeight: FontWeight.bold,
-                                        color: board[index] == 'X'
-                                            ? Colors.cyanAccent
-                                            : Colors.pinkAccent,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 35),
-                      ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.purpleAccent,
-                          padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(30),
-                          ),
-                        ),
-                        onPressed: _resetGame,
-                        icon: const Icon(Icons.refresh, color: Colors.white),
-                        label: const Text(
-                          'Restart Game',
-                          style: TextStyle(fontSize: 18, color: Colors.white, fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                    ],
+                    ),
                   ),
                 ),
               );
@@ -270,12 +909,163 @@ jobs:
           }
           EOF
 
-          # 6. Resolve dependencies & build release APK
-          flutter pub get
-          flutter build apk --release
+      - name: Write automated tests
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
 
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-release
-          path: build/app/outputs/flutter-apk/app-release.apk
+          cat > test/game_test.dart <<'EOF'
+          import 'dart:math';
+
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:tic_tac_toe/game.dart';
+
+          void main() {
+            test('Detects every winning line', () {
+              for (final line in winningLines) {
+                final board = List.filled(9, '');
+                for (final cell in line) {
+                  board[cell] = 'X';
+                }
+                expect(outcome(board), 'X');
+                expect(winningCells(board), line);
+              }
+            });
+
+            test('Detects a draw', () {
+              expect(
+                outcome(['X', 'O', 'X', 'X', 'O', 'O', 'O', 'X', 'X']),
+                'draw',
+              );
+            });
+
+            test('Hard AI blocks an immediate loss', () {
+              final board = ['X', 'X', '', '', 'O', '', '', '', ''];
+              expect(chooseMove(board, 'Hard', Random(1)), 2);
+              expect(board[2], '');
+            });
+
+            test('Hard AI takes a winning move', () {
+              final board = ['O', 'O', '', 'X', 'X', '', 'X', '', ''];
+              expect(chooseMove(board, 'Hard', Random(1)), 2);
+            });
+
+            test('No move is returned for a completed game', () {
+              expect(
+                chooseMove(
+                  ['X', 'X', 'X', 'O', 'O', '', '', '', ''],
+                  'Hard',
+                  Random(1),
+                ),
+                -1,
+              );
+            });
+
+            test('Hard AI cannot lose against any human continuation', () {
+              void explore(List<String> board, bool humanTurn) {
+                final result = outcome(board);
+                expect(result, isNot('X'));
+                if (result.isNotEmpty) return;
+
+                if (humanTurn) {
+                  for (var i = 0; i < 9; i++) {
+                    if (board[i].isNotEmpty) continue;
+                    final next = List<String>.from(board)..[i] = 'X';
+                    explore(next, false);
+                  }
+                } else {
+                  final move = chooseMove(board, 'Hard', Random(42));
+                  final next = List<String>.from(board)..[move] = 'O';
+                  explore(next, true);
+                }
+              }
+
+              explore(List.filled(9, ''), true);
+            });
+          }
+          EOF
+
+          cat > test/widget_test.dart <<'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:tic_tac_toe/main.dart';
+
+          void main() {
+            testWidgets('Game renders and supports theme changes', (tester) async {
+              SharedPreferences.setMockInitialValues({});
+              final preferences = await SharedPreferences.getInstance();
+
+              await tester.pumpWidget(
+                TicTacToeApp(preferences: preferences),
+              );
+              await tester.pumpAndSettle();
+
+              expect(find.text('TIC TAC TOE'), findsOneWidget);
+              expect(find.text('Your move'), findsOneWidget);
+              expect(find.text('Vs AI'), findsOneWidget);
+
+              await tester.tap(find.byTooltip('Switch theme'));
+              await tester.pumpAndSettle();
+              expect(preferences.getBool('dark'), false);
+
+              await tester.pumpWidget(const SizedBox.shrink());
+              await tester.pumpAndSettle();
+            });
+          }
+          EOF
+
+      - name: Install dependencies
+        working-directory: generated_app
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Format, analyze, and test
+        working-directory: generated_app
+        run: |
+          set -euo pipefail
+          dart format lib test
+          flutter analyze
+          flutter test
+
+      - name: Build release APK
+        working-directory: generated_app
+        run: |
+          set -euo pipefail
+
+          flutter build apk \
+            --release \
+            --build-name=1.0.0 \
+            --build-number="${{ github.run_number }}"
+
+      - name: Prepare APK and checksum
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          cp "$APP_DIR/build/app/outputs/flutter-apk/app-release.apk" \
+            dist/tic-tac-toe-pro.apk
+
+          test -s dist/tic-tac-toe-pro.apk
+          unzip -t dist/tic-tac-toe-pro.apk > /dev/null
+
+          (
+            cd dist
+            sha256sum tic-tac-toe-pro.apk > SHA256SUMS.txt
+          )
+
+          {
+            echo "## Tic Tac Toe Pro"
+            echo ""
+            echo "- APK build completed successfully."
+            echo "- Package ID: \`cok.aokjfjigg.tic.java\`"
+            echo "- Version: \`1.0.0 (${{ github.run_number }})\`"
+            echo "- Features: offline AI, local multiplayer, saved scores, themes, sounds."
+            echo "- Signing: Flutter template debug key; not a production signing identity."
+            echo ""
+            echo "Download the APK artifact below and extract the ZIP."
+            echo ""
+            echo "### SHA-256"
+            echo '
